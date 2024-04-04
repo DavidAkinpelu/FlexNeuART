@@ -25,7 +25,11 @@ import argparse
 import numpy as np
 import wandb
 
-from transformers.optimization import get_constant_schedule_with_warmup
+import bitsandbytes as bnb
+
+from galore_torch import GaLoreAdamW8bit
+
+from transformers.optimization import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 from typing import List
 
 import flexneuart.config
@@ -57,6 +61,8 @@ from collections import namedtuple
 
 OPT_SGD = 'sgd'
 OPT_ADAMW = 'adamw'
+OPT_BNB_ADAMW = 'bnb_adamw'
+OPT_GALORE = 'galore'
 
 VALID_ALWAYS = 'always'
 VALID_LAST = 'last_epoch'
@@ -65,9 +71,14 @@ VALID_NONE = 'never'
 LR_SCHEDULE_CONST = 'const'
 LR_SCHEDULE_CONST_WARMUP = 'const_with_warmup'
 LR_SCHEDULE_ONE_CYCLE_LR = 'one_cycle'
+LR_SCHEDULE_LINEAR = 'linear'
+LR_SCHEDULE_LINEAR_WARMUP = 'linear_with_warmup'
 
 TrainParams = namedtuple('TrainParams',
                     ['optim',
+                     'optim_bits',
+                     'optim_is_paged',
+                     'max_grad_norm',
                      'device_name',
                      'init_lr', 'init_bert_lr', 
                      'init_aggreg_lr', 'init_bart_lr',
@@ -100,6 +111,7 @@ def get_lr_desc(optimizer):
 
 def train_iteration(model_holder, device_name,
                     sync_qty_target,
+                    model_out_dir,
                     lr, bert_lr, aggreg_lr, interact_lr,
                     is_main_proc, device_qty,
                     loss_obj,
@@ -129,6 +141,14 @@ def train_iteration(model_holder, device_name,
         bart_params = {'params': [v for k, v in all_params if k in bart_param_keys], 'lr': bert_lr}
     else:
         bert_params = {'params': [v for k, v in all_params if k in bert_param_keys], 'lr': bert_lr}
+
+    if train_params.optim == OPT_GALORE:
+        if train_params.init_bart_lr is not None:
+            bart_params.update({"rank": 1024, "update_proj_gap": 500,
+                                "galore_scale": 0.25})
+        elif bert_params:
+            bert_params.update({"rank": 1024, "update_proj_gap": 500,
+                                "galore_scale": 0.25})
     
     if aggreg_lr is not None:
         aggreg_params = {'params': [v for k, v in all_params if k in aggreg_keys], 'lr': aggreg_lr}
@@ -154,10 +174,20 @@ def train_iteration(model_holder, device_name,
     if train_params.optim == OPT_ADAMW:
         optimizer = torch.optim.AdamW(params,
                                       lr=lr, weight_decay=train_params.weight_decay)
+        
+    elif train_params.optim == OPT_BNB_ADAMW:
+        optimizer = bnb.optim.AdamW(params,lr=lr, 
+                                         weight_decay=train_params.weight_decay,
+                                         optim_bits=train_params.optim_bits,
+                                         is_paged=train_params.optim_is_paged)
     elif train_params.optim == OPT_SGD:
         optimizer = torch.optim.SGD(params,
                                     lr=lr, weight_decay=train_params.weight_decay,
                                     momentum=train_params.momentum)
+        
+    elif train_params.optim == OPT_GALORE:
+        optimizer = GaLoreAdamW8bit(params,
+                                    lr=lr, weight_decay=train_params.weight_decay)
     else:
         raise Exception('Unsupported optimizer: ' + train_params.optim)
 
@@ -165,10 +195,15 @@ def train_iteration(model_holder, device_name,
     lr_steps = int(math.ceil(max_train_qty / train_params.batch_size))
     scheduler = None
     lr_schedule= train_params.lr_schedule
-    if lr_schedule == LR_SCHEDULE_CONST:
+    if lr_schedule in [LR_SCHEDULE_CONST, LR_SCHEDULE_LINEAR]:
         if train_params.warmup_pct:
             raise Exception('Warm-up cannot be used with LR schedule: ' + lr_schedule)
-    elif lr_schedule in [LR_SCHEDULE_CONST_WARMUP, LR_SCHEDULE_ONE_CYCLE_LR]:
+        if lr_schedule == LR_SCHEDULE_LINEAR:
+            if is_main_proc:
+                print(f'Using a linear scheduler with no warm-up')
+            scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=lr_steps)
+            
+    elif lr_schedule in [LR_SCHEDULE_CONST_WARMUP, LR_SCHEDULE_ONE_CYCLE_LR, LR_SCHEDULE_LINEAR_WARMUP]:
         if not train_params.warmup_pct:
             raise Exception('LR schedule: ' + lr_schedule + ' requires a warm-up parameter!')
 
@@ -177,11 +212,19 @@ def train_iteration(model_holder, device_name,
         if lr_schedule == LR_SCHEDULE_ONE_CYCLE_LR:
             if is_main_proc:
                 print(f'Using a one-cycle scheduler with a warm-up for {num_warmup_steps} steps')
+            max_lr = list(filter(None, [lr, bert_lr, interact_lr, aggreg_lr]))
+
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,
                                                             total_steps=lr_steps,
-                                                            max_lr=[lr, bert_lr, interact_lr, aggreg_lr],
+                                                            max_lr=max_lr,
                                                             anneal_strategy='linear',
                                                             pct_start=train_params.warmup_pct)
+        elif lr_schedule == LR_SCHEDULE_LINEAR_WARMUP:
+            if is_main_proc:
+                print(f'Using a linear scheduler with a warm-up for {num_warmup_steps} steps')
+
+            scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps,
+                                                            num_training_steps=lr_steps)
         else:
             assert lr_schedule == LR_SCHEDULE_CONST_WARMUP
             if is_main_proc:
@@ -247,7 +290,7 @@ def train_iteration(model_holder, device_name,
 
     sync_qty = 0
 
-    for batch in train_iterator():
+    for i , batch in enumerate(train_iterator()):
 
         with auto_cast_class():
             batch: BatchObject = batch
@@ -255,12 +298,12 @@ def train_iteration(model_holder, device_name,
             model_scores = model(*batch.features)
             assert len(model_scores) == len(batch)
             scores = model_scores + batch.cand_scores * cand_score_weight
-
             data_qty = len(batch)
             count = data_qty // train_sampler.get_chunk_size()
             assert count * train_sampler.get_chunk_size() == data_qty
             scores = scores.reshape(count, 1 + neg_qty_per_query)
             loss = loss_obj.compute(scores)
+            
             if wandb_run is not None:
                 wandb_run.log({'loss': loss.item()})
 
@@ -276,7 +319,14 @@ def train_iteration(model_holder, device_name,
 
         # If it's time to validate, we need to interrupt the batch
         if total_qty - total_prev_qty >= batch_size:
+            
+            if train_params.max_grad_norm is not None:
+                max_grad_norm = train_params.max_grad_norm
+                if train_params.amp:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
+        
             scaler.step(optimizer)
             scaler.update()
 
@@ -295,10 +345,11 @@ def train_iteration(model_holder, device_name,
                         torch.distributed.barrier()
                         sync_qty += 1
                         avg_model_params(model, train_params.amp)
-
+                    
             batch_id += 1
 
         avg_loss = total_loss / float(max(1, total_qty))
+
 
         if pbar is not None:
             pbar.update(count)
@@ -308,7 +359,6 @@ def train_iteration(model_holder, device_name,
 
         if wandb_run is not None:
             wandb_run.log({'avg_loss': avg_loss})
-
 
     # Final model averaging in the end.
 
@@ -443,6 +493,7 @@ def do_train(device_qty,
                 'aggreg_lr': aggreg_lr,
                 'interact_lr': interact_lr,
                 'model_holder': model_holder,
+                'model_out_dir': model_out_dir,
                 'sync_qty_target': sync_qty_target,
                 'device_qty': device_qty,
                 'loss_obj': loss_obj,
@@ -559,12 +610,12 @@ def run_model_wrapper(model, is_main_proc, rerank_run_file_name,
     model.to(device_name)
 
     res = run_model(model,
-                      device_name, batch_size, amp,
-                      max_query_len, max_doc_len,
-                      dataset, orig_run,
-                      cand_score_weight=cand_score_weight,
-                      desc=desc, 
-                      use_progress_bar=is_main_proc)
+                    device_name, batch_size, amp,
+                    max_query_len, max_doc_len,
+                    dataset, orig_run,
+                    cand_score_weight=cand_score_weight,
+                    desc=desc, 
+                    use_progress_bar=is_main_proc)
     
     write_run_dict(res, rerank_run_file_name)
 
@@ -723,7 +774,8 @@ def main_cli():
     
     parser.add_argument('--lr_schedule', metavar='LR schedule',
                         default=LR_SCHEDULE_CONST,
-                        choices=[LR_SCHEDULE_CONST, LR_SCHEDULE_CONST_WARMUP, LR_SCHEDULE_ONE_CYCLE_LR])
+                        choices=[LR_SCHEDULE_CONST, LR_SCHEDULE_CONST_WARMUP, LR_SCHEDULE_ONE_CYCLE_LR,
+                                 LR_SCHEDULE_LINEAR, LR_SCHEDULE_LINEAR_WARMUP])
 
     parser.add_argument('--device_qty', type=int, metavar='# of device for multi-GPU training',
                         default=1, help='# of GPUs for multi-GPU training')
@@ -743,8 +795,12 @@ def main_cli():
     parser.add_argument('--seed', metavar='random seed', help='random seed',
                         type=int, default=42)
 
-    parser.add_argument('--optim', metavar='optimizer', choices=[OPT_SGD, OPT_ADAMW], default=OPT_ADAMW,
+    parser.add_argument('--optim', metavar='optimizer', choices=[OPT_SGD, OPT_ADAMW, OPT_BNB_ADAMW, OPT_GALORE], default=OPT_ADAMW,
                         help='Optimizer')
+    
+    parser.add_argument('--optim_bits', metavar='optimizer bits', type=int, default=32, help='Optimizer bits')
+
+    parser.add_argument('--optim_is_paged', action='store_true', help='use paged optimizer', default=False)
 
     parser.add_argument('--loss_margin', metavar='loss margin', help='Margin in the margin loss',
                         type=float, default=1.0)
@@ -766,6 +822,22 @@ def main_cli():
 
     parser.add_argument('--init_bert_lr', metavar='init BERT learn. rate',
                         type=float, default=None, help='initial learning rate for BERT parameters')
+    
+    parser.add_argument('--use_lora', action='store_true', help='use LORA', default=False)
+    
+    parser.add_argument('--lora_r', metavar='LORA r', type=int, default=32, help='LORA r')
+
+    parser.add_argument('--lora_alpha', metavar='LORA alpha', type=int, default=64, help='LORA alpha')
+
+    parser.add_argument('--lora_dropout', metavar='LORA dropout', type=float, default=0.1, help='LORA dropout')
+
+    parser.add_argument('--lora_target_modules', metavar='lora target modules', type=list, default=None, help='lora target modules')
+
+    parser.add_argument('use_sep', action='store_true', default=False, help='use sep emnb')
+
+    parser.add_argument('use_mean_pool', action='store_true', default=False, help='use mean pool')
+
+    parser.add_argument('trust_remote_code', action='store_true', default=False)
     
     parser.add_argument('--init_bart_lr', metavar='init BART learn. rate',
                         type=float, default=None, help='initial learning rate for BERT parameters')
@@ -795,6 +867,10 @@ def main_cli():
     parser.add_argument('--batches_per_train_epoch', metavar='# of rand. batches per epoch',
                         type=int, default=None,
                         help='# of random batches per epoch: 0 tells to use all data')
+    
+    parser.add_argument('--max_grad_norm', metavar='max grad norm for clipping',
+                        type=float, default=None,
+                        help='max norm for gradient clipping')
 
     parser.add_argument('--max_query_val', metavar='max # of val queries',
                         type=int, default=None,
@@ -885,6 +961,9 @@ def main_cli():
     # For details on our serialization approach, see comments in the ModelWrapper
     model_holder : ModelSerializer = None
 
+    if args.use_lora and args.amp:
+        args.amp = False
+
     if args.init_model is not None:
         print('Loading a complete model from:', args.init_model)
         model_holder = ModelSerializer.load_all(args.init_model)
@@ -905,6 +984,9 @@ def main_cli():
     if args.neg_qty_per_query < 1:
         print('A number of negatives per query cannot be < 1')
         sys.exit(1)
+
+    model = model_holder.model
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad)/10**6)
 
     os.makedirs(args.model_out_dir, exist_ok=True)
     print(model_holder.model)
@@ -950,9 +1032,10 @@ def main_cli():
                    config=config,
                    name=args.wandb_run_name,
                    group=args.wandb_group_name)
+        
+        wandb_run.watch(model_holder.model, log='gradients', log_freq=1000)
     else:
         wandb_run = None
-    
     
 
     train_params = TrainParams(init_lr=args.init_lr, init_bert_lr=args.init_bert_lr,
@@ -968,6 +1051,7 @@ def main_cli():
                                batches_per_train_epoch=args.batches_per_train_epoch,
                                save_epoch_snapshots=args.save_epoch_snapshots,
                                batch_size=args.batch_size, batch_size_val=args.batch_size_val,
+                               max_grad_norm=args.max_grad_norm, 
                                # These lengths must come from the model serializer object, not from the arguments,
                                # because they can be overridden when the model is loaded.
                                max_query_len=model_holder.max_query_len, max_doc_len=model_holder.max_doc_len,
@@ -977,8 +1061,8 @@ def main_cli():
                                use_external_eval=args.use_external_eval, eval_metric=args.eval_metric.lower(),
                                print_grads=args.print_grads,
                                shuffle_train=not args.no_shuffle_train,
-                               valid_type=args.valid_type,
-                               optim=args.optim)
+                               valid_type=args.valid_type, optim=args.optim, 
+                               optim_bits=args.optim_bits, optim_is_paged=args.optim_is_paged)
 
     do_train(
         device_qty=device_qty,

@@ -15,8 +15,10 @@ from transformers import PreTrainedTokenizerBase
 from flexneuart.config import BERT_BASE_MODEL
 
 from flexneuart.config import DEFAULT_DEVICE_GPU
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from flexneuart.models import model_registry
+
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
 
 # An attribute to store the main BERT encoder
 BERT_ATTR='bert'
@@ -74,6 +76,98 @@ def init_model(obj_ref, bert_flavor : str, is_aggreg: bool=False,
     print('Model type:', obj_ref.BERT_MODEL,
         '# of channels:', obj_ref.CHANNELS,
         'hidden layer size:', obj_ref.BERT_SIZE,
+        'input window size:', obj_ref.MAXLEN,
+        'no token type IDs:', obj_ref.no_token_type_ids)
+    return
+    
+def init_lora_model(obj_ref, base_model_flavor, quant_type, lora_target_modules, 
+                        lora_r, lora_alpha, lora_dropout, load_in_4bit, 
+                        load_in_8bit, trust_remote_code, use_dora):
+    
+    
+    if quant_type == "qlora":
+        if load_in_4bit or load_in_8bit:
+            raise ValueError("Cannot load in 4-bit or 8-bit models with qlora quantization")
+        if load_in_4bit:
+            model = AutoModel.from_pretrained(base_model_flavor,
+                                            trust_remote_code=trust_remote_code,
+                                            load_in_4bit=True,
+                                            bnb_4bit_use_double_quant=True,
+                                            bnb_4bit_quant_type=quant_type,
+                                            bnb_4bit_compute_dtype=torch.bfloat16)
+        elif load_in_8bit:
+            model = AutoModel.from_pretrained(base_model_flavor,
+                                            trust_remote_code=trust_remote_code,
+                                            load_in_8bit=True,
+                                            bnb_8bit_quant_type=quant_type,
+                                            bnb_8bit_compute_dtype=torch.bfloat16)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(base_model_flavor,
+                                            trust_remote_code=trust_remote_code,
+                                            torch_dtype=torch.float16 if quant_type == "aqlm" else torch.bfloat16,
+                                            low_cpu_mem_usage=True)
+        model  = model.model
+         
+    model.config.use_cache = False
+        
+    model.config.pretraining_tp = 1 
+        
+    if quant_type is not None and quant_type != "aqlm":    
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, 
+                                                gradient_checkpointing_kwargs={'use_reentrant': True})
+           
+    config = model.config
+
+    tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(base_model_flavor, 
+                                                                       config=config)
+    
+    pad_token =  '[PAD]'
+    if pad_token not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"pad_token": pad_token})
+        tokenizer.padding_side = "right"  # Fix for fp16
+        model.resize_token_embeddings(len(tokenizer))
+
+    sep_token =  '[SEP]'
+    if sep_token not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"sep_token": sep_token})
+        model.resize_token_embeddings(len(tokenizer))
+
+    if quant_type == "loftq":
+        model = PeftModel.from_pretrained(
+            model,
+            base_model_flavor,
+            subfolder="loftq_init"
+        )
+    else:
+        peft_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            bias="none",
+            lora_dropout=lora_dropout,
+            task_type=TaskType.FEATURE_EXTRACTION,
+            target_modules=lora_target_modules,
+            use_dora=use_dora,  
+        )
+
+        model = get_peft_model(model, peft_config)
+
+    model.print_trainable_parameters()
+
+    setattr(obj_ref, config.model_type, model)
+    obj_ref.config = config
+    obj_ref.tokenizer = tokenizer
+    obj_ref.no_token_type_ids = not 'token_type_ids' in tokenizer.model_input_names
+
+    obj_ref.CHANNELS = config.num_hidden_layers + 1
+    obj_ref.model_dim = config.hidden_size
+    obj_ref.MAXLEN = config.max_position_embeddings
+    obj_ref.model_type = config.model_type
+
+    obj_ref.EOS_TOK_ID = tokenizer.eos_token_id
+
+    print('Model type:', obj_ref.model_type,
+        '# of channels:', obj_ref.CHANNELS,
+        'hidden layer size:', obj_ref.model_dim,
         'input window size:', obj_ref.MAXLEN,
         'no token type IDs:', obj_ref.no_token_type_ids)
     return
