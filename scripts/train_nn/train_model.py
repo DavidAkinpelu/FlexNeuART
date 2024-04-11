@@ -350,7 +350,6 @@ def train_iteration(model_holder, device_name,
 
         avg_loss = total_loss / float(max(1, total_qty))
 
-
         if pbar is not None:
             pbar.update(count)
             pbar.refresh()

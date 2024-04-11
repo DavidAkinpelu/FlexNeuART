@@ -26,6 +26,7 @@ from flexneuart.models.base import BaseModel
 from flexneuart.models.utils import init_lora_model
 
 
+
 class DecoderBaseRanker(BaseModel):
     """
        The base class for all Transformer-based ranking models.
@@ -48,13 +49,17 @@ class DecoderBaseRanker(BaseModel):
         init_lora_model(self, base_model_flavor=base_model_flavor, quant_type=quant_type, lora_target_modules=lora_target_modules, 
                         lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, load_in_4bit=load_in_4bit, 
                         load_in_8bit=load_in_8bit, trust_remote_code=trust_remote_code, use_dora=use_dora)
+        
+        self.quant_type = quant_type
+        self.use_dora = use_dora
+
 
     def bert_param_names(self):
         """
         :return: a list of the lora-parameters.
         For convention, the funtion names still remain bert_param_names, although
         """
-        return set([k for k in self.state_dict().keys() if "peft" in k])
+        return set([k for k in self.state_dict().keys() if "lora" in k])
     
     def forward(self, **inputs):
         raise NotImplementedError

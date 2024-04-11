@@ -76,7 +76,7 @@ class NeuralRanker(BaseRanker):
 
         self.device_name = device_name
         self.cand_score_weight = cand_score_weight
-        model_holder = ModelSerializer.load_all(model_file_name_full_path)
+        model_holder = ModelSerializer.load_all(model_file_name_full_path, inference=True)
 
         self.model = model_holder.model
         self.model.to(device_name)
