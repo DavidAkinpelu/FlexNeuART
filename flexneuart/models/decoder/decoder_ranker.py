@@ -79,6 +79,9 @@ class DecoderRanker(DecoderBaseRanker):
             "Document array length must be the same as query array length!"
         if self.use_sep:
             query_texts = [q + '[SEP]' for q in query_texts]
+        else:
+            query_texts = ["query: " + q for q in query_texts]
+            doc_texts = ["document: " + d for d in doc_texts]
         input_list = list(zip(query_texts, doc_texts))
 
         
