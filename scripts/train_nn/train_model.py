@@ -822,22 +822,6 @@ def main_cli():
     parser.add_argument('--init_bert_lr', metavar='init BERT learn. rate',
                         type=float, default=None, help='initial learning rate for BERT parameters')
     
-    parser.add_argument('--use_lora', action='store_true', help='use LORA', default=False)
-    
-    parser.add_argument('--lora_r', metavar='LORA r', type=int, default=32, help='LORA r')
-
-    parser.add_argument('--lora_alpha', metavar='LORA alpha', type=int, default=64, help='LORA alpha')
-
-    parser.add_argument('--lora_dropout', metavar='LORA dropout', type=float, default=0.1, help='LORA dropout')
-
-    parser.add_argument('--lora_target_modules', metavar='lora target modules', type=list, default=None, help='lora target modules')
-
-    parser.add_argument('use_sep', action='store_true', default=False, help='use sep emnb')
-
-    parser.add_argument('use_mean_pool', action='store_true', default=False, help='use mean pool')
-
-    parser.add_argument('trust_remote_code', action='store_true', default=False)
-    
     parser.add_argument('--init_bart_lr', metavar='init BART learn. rate',
                         type=float, default=None, help='initial learning rate for BERT parameters')
     
@@ -959,9 +943,6 @@ def main_cli():
 
     # For details on our serialization approach, see comments in the ModelWrapper
     model_holder : ModelSerializer = None
-
-    if args.use_lora and args.amp:
-        args.amp = False
 
     if args.init_model is not None:
         print('Loading a complete model from:', args.init_model)
