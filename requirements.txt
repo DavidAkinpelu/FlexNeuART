@@ -15,6 +15,7 @@ pyjnius
 
 torch
 torchtext
+peft
 
 transformers
 spacy
